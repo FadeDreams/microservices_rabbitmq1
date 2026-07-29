@@ -1,55 +1,97 @@
-const amqp = require('amqplib'); const axios = require('axios');
+const amqp = require('amqplib');
+const axios = require('axios');
 const dotenv = require('dotenv');
 dotenv.config();
 
-
 const order_api_url = process.env.ORDER_API_URL || 'http://localhost:5002';
 const queueName = 'queue1';
-const rabbitMQHost = 'amqp://localhost'; // Update with your RabbitMQ server's URL
+const exchangeName = 'queue1.exchange';
+const dlxName = 'queue1.dlx';
+const retryQueueName = 'queue1.retry';
+const deadQueueName = 'queue1.dead';
+const rabbitMQHost = process.env.RABBITMQ_HOST || 'amqp://localhost';
+
+const MAX_RETRIES = 5;
+const RETRY_TTL_MS = 30000; // 30s backoff between retries
+
+function getDeathCount(msg) {
+  const xDeath = msg.properties?.headers?.['x-death'];
+  if (!xDeath) return 0;
+  const entry = xDeath.find((d) => d.queue === queueName);
+  return entry?.count ?? 0;
+}
 
 async function consumeMessages() {
   console.log('consumeMessages');
-  try {
-    const connection = await amqp.connect(rabbitMQHost);
-    const channel = await connection.createChannel();
-    await channel.assertQueue(queueName, { durable: true });
+  const connection = await amqp.connect(rabbitMQHost);
+  const channel = await connection.createChannel();
 
-    console.log(`[*] Waiting for messages in ${queueName}. To exit, press Ctrl-C`);
+  await channel.assertExchange(exchangeName, 'direct', { durable: true });
+  await channel.assertExchange(dlxName, 'direct', { durable: true });
 
-    return new Promise((resolve, reject) => {
-      channel.consume(queueName, async (msg) => {
-        if (msg !== null) {
-          const message = msg.content.toString();
-          const messageObject = JSON.parse(message);
+  // Main queue, dead-letters into the retry flow on nack
+  await channel.assertQueue(queueName, {
+    durable: true,
+    arguments: {
+      'x-dead-letter-exchange': dlxName,
+      'x-dead-letter-routing-key': 'queue1.retry',
+    },
+  });
+  await channel.bindQueue(queueName, exchangeName, queueName);
 
-          console.log(`[x] Received`, messageObject);
+  // Retry queue: holds message for RETRY_TTL_MS, then dead-letters back to the main queue
+  await channel.assertQueue(retryQueueName, {
+    durable: true,
+    arguments: {
+      'x-message-ttl': RETRY_TTL_MS,
+      'x-dead-letter-exchange': exchangeName,
+      'x-dead-letter-routing-key': queueName,
+    },
+  });
+  await channel.bindQueue(retryQueueName, dlxName, 'queue1.retry');
 
-          // Update the message to set is_open to false
-          messageObject.is_open = false;
+  // Terminal dead queue: no further DLX, poison messages land here for good
+  await channel.assertQueue(deadQueueName, { durable: true });
+  await channel.bindQueue(deadQueueName, dlxName, 'queue1.dead');
 
-          // Make a PUT request using Axios with the updated JSON object
-          try {
-            const putUrl = `${order_api_url}/${messageObject.id}`;
-            console.log(putUrl);
-            console.log(messageObject);
-            const response = await axios.put(putUrl, messageObject);
-            console.log('Response:', response.data);
-            resolve(1);
-          } catch (error) {
-            console.error('Error sending PUT request:', error);
-            // You can reject the promise with an error status
-            reject(error);
-          }
-          channel.ack(msg); // Acknowledge the message to remove it from the queue.
-        }
-      });
-    });
-  } catch (error) {
-    console.error(error);
-    // You can reject the promise with an error status in case of an error here.
-    reject(error);
-  }
+  console.log(`[*] Waiting for messages in ${queueName}. To exit, press Ctrl-C`);
+
+  channel.consume(queueName, async (msg) => {
+    if (msg === null) return;
+
+    let messageObject;
+    try {
+      const message = msg.content.toString();
+      messageObject = JSON.parse(message);
+      console.log('[x] Received', messageObject);
+    } catch (parseError) {
+      // Malformed JSON will never parse successfully no matter how many
+      // times we retry, so send straight to the dead queue.
+      console.error('Error parsing message, routing to dead queue:', parseError);
+      channel.publish(dlxName, 'queue1.dead', msg.content, { headers: msg.properties.headers });
+      channel.ack(msg);
+      return;
+    }
+
+    try {
+      messageObject.is_open = false;
+      const putUrl = `${order_api_url}/${messageObject.id}`;
+      console.log(putUrl, messageObject);
+      const response = await axios.put(putUrl, messageObject);
+      console.log('Response:', response.data);
+      channel.ack(msg); // only ack after the PUT actually succeeds
+    } catch (error) {
+      const deathCount = getDeathCount(msg);
+      console.error(`Error sending PUT request (attempt ${deathCount + 1}):`, error.message);
+
+      if (deathCount >= MAX_RETRIES) {
+        channel.publish(dlxName, 'queue1.dead', msg.content, { headers: msg.properties.headers });
+        channel.ack(msg);
+      } else {
+        channel.nack(msg, false, false); // -> DLX -> retry queue -> back to main queue after TTL
+      }
+    }
+  });
 }
 
 module.exports = consumeMessages;
-
