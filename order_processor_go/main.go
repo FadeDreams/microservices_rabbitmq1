@@ -2,14 +2,15 @@ package main
 
 import (
 	"bytes"
-	"os"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
-	"github.com/streadway/amqp"
+	"os"
+
 	"github.com/joho/godotenv"
+	amqp "github.com/rabbitmq/amqp091-go" // switched from streadway/amqp (unmaintained) to the maintained fork
 )
 
 // Struct to represent the message
@@ -26,39 +27,43 @@ func failOnError(err error, msg string) {
 	}
 }
 
-func sendPutRequest(url string, id int) {
+// sendPutRequest now returns an error instead of swallowing it,
+// so the consumer loop can decide whether to ack or nack.
+func sendPutRequest(url string, id int) error {
 	fmt.Printf("Sending PUT request to URL: %s\n", url)
-
 	data := map[string]bool{
 		"is_open": true,
 	}
-	jsonStr, _ := json.Marshal(data)
-
-	// Construct the URL with the extracted ID
-	putURL := fmt.Sprintf("%s%d", url, id)
-
-	// Create a request
-	req, err := http.NewRequest("PUT", putURL, bytes.NewBuffer(jsonStr))
+	jsonStr, err := json.Marshal(data)
 	if err != nil {
-		fmt.Println("Error creating request:", err)
-		return
+		return fmt.Errorf("error marshaling payload: %w", err)
 	}
 
-	// Set the request content type
+	putURL := fmt.Sprintf("%s%d", url, id)
+
+	req, err := http.NewRequest("PUT", putURL, bytes.NewBuffer(jsonStr))
+	if err != nil {
+		return fmt.Errorf("error creating request: %w", err)
+	}
 	req.Header.Set("Content-Type", "application/json")
 
-	// Send the request
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Println("Error sending request:", err)
-		return
+		return fmt.Errorf("error sending request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Read and print the response
 	body, _ := ioutil.ReadAll(resp.Body)
 	fmt.Println("Response:", string(body))
+
+	// Treat non-2xx as a failure so it gets nack'd and retried/dead-lettered
+	// instead of being silently ack'd.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("PUT request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	return nil
 }
 
 func helloHandler(w http.ResponseWriter, r *http.Request) {
@@ -70,7 +75,7 @@ func main() {
 	if err != nil {
 		log.Fatal("Error loading .env file")
 	}
-	// Define your RabbitMQ connection and message handling here
+
 	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/") // Replace with your RabbitMQ server URL
 	failOnError(err, "Failed to connect to RabbitMQ")
 	defer conn.Close()
@@ -79,20 +84,31 @@ func main() {
 	failOnError(err, "Failed to open a channel")
 	defer ch.Close()
 
+	// Queue now declares a dead-letter exchange, so nack'd messages
+	// (parse failures, failed PUT requests) route into the retry/DLQ
+	// topology instead of vanishing or looping.
 	q, err := ch.QueueDeclare(
 		"queue1", // Queue name
 		true,     // Durable
 		false,    // Delete when unused
 		false,    // Exclusive
 		false,    // No-wait
-		nil,      // Arguments
+		amqp.Table{
+			"x-dead-letter-exchange":    "dlx.orders",
+			"x-dead-letter-routing-key": "orders.process.dead",
+		},
 	)
 	failOnError(err, "Failed to declare a queue")
+
+	// Prefetch 1 so a single consumer processes one message at a time —
+	// pairs well with explicit ack/nack below.
+	err = ch.Qos(1, 0, false)
+	failOnError(err, "Failed to set QoS")
 
 	msgs, err := ch.Consume(
 		q.Name, // Queue name
 		"",     // Consumer name
-		true,   // Auto-Ack
+		false,  // Auto-Ack -> now false, we ack/nack explicitly
 		false,  // Exclusive
 		false,  // No-local
 		false,  // No-wait
@@ -100,16 +116,11 @@ func main() {
 	)
 	failOnError(err, "Failed to register a consumer")
 
-	// Print the message before starting the HTTP server
 	fmt.Printf("waiting for the new messages...")
 
-	// Define your URL for PUT requests
-	//url := "http://localhost:5006/"
 	url := os.Getenv("ORDER_API_URL")
 
-	// Start the HTTP server
 	http.HandleFunc("/go", helloHandler)
-	//serverAddr := ":5006"
 	serverAddr := os.Getenv("SERVER_ADDR")
 	fmt.Printf("Server is running on %s\n", serverAddr)
 
@@ -118,26 +129,39 @@ func main() {
 			message := string(d.Body)
 			fmt.Printf("Received a message: %s\n", message)
 
-			// Parse the received message
 			var msg Message
-			err := json.Unmarshal([]byte(message), &msg)
-			if err != nil {
+			if err := json.Unmarshal(d.Body, &msg); err != nil {
 				fmt.Println("Error parsing message:", err)
+				// Malformed payload will never parse successfully on retry —
+				// don't requeue to the same queue, send straight to DLX.
+				if nackErr := d.Nack(false, false); nackErr != nil {
+					fmt.Println("Error nacking message:", nackErr)
+				}
 				continue
 			}
 
-			// Send the PUT request with the extracted ID
-			sendPutRequest(url, msg.ID)
+			if err := sendPutRequest(url, msg.ID); err != nil {
+				fmt.Println("Error sending request:", err)
+				// Could be transient (network blip, downstream 500) —
+				// nack without requeue so it flows into the retry/DLQ
+				// topology (delay queue with backoff, then DLQ after N attempts)
+				// rather than looping instantly against this queue.
+				if nackErr := d.Nack(false, false); nackErr != nil {
+					fmt.Println("Error nacking message:", nackErr)
+				}
+				continue
+			}
+
+			if ackErr := d.Ack(false); ackErr != nil {
+				fmt.Println("Error acking message:", ackErr)
+			}
 		}
 	}()
 
-	// Start the HTTP server
 	err = http.ListenAndServe(serverAddr, nil)
 	if err != nil {
 		fmt.Printf("Error starting server: %s\n", err)
 	}
 
-	// The HTTP server is running and handling requests
 	select {}
 }
-
